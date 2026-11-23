@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+APP_USER="${app_user}"
+SRC=/tmp/vp
+BASE=/opt/video-pipeline
+APT="apt-get -o DPkg::Lock::Timeout=300 -y"
+
+echo "== user"
+id "$APP_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$APP_USER"
+
+echo "== packages"
+$APT update
+$APT install ffmpeg redis-server python3-venv python3-pip unzip curl wget apt-transport-https software-properties-common
+
+echo "== redis (local only)"
+if grep -q '^bind ' /etc/redis/redis.conf; then
+  sed -i 's/^bind .*/bind 127.0.0.1/' /etc/redis/redis.conf
+else
+  echo 'bind 127.0.0.1' >> /etc/redis/redis.conf
+fi
+systemctl enable redis-server
+systemctl reset-failed redis-server || true
+systemctl restart redis-server
+
+echo "== folders and python environment"
+install -d -o "$APP_USER" -g "$APP_USER" "$BASE" "$BASE/app"
+[ -d "$BASE/venv" ] || sudo -u "$APP_USER" python3 -m venv "$BASE/venv"
+echo "== python packages"
+sudo -u "$APP_USER" "$BASE/venv/bin/pip" install --quiet --upgrade pip boto3 redis flask requests
+
+echo "== application files"
+install -m 644 -o "$APP_USER" -g "$APP_USER" "$SRC/transcoder.py" "$SRC/worker.py" "$SRC/storage_tool.py" "$SRC/zoom_webhook.py" "$BASE/app/"
+
+echo "== settings (secret keys)"
+install -m 640 -o root -g "$APP_USER" "$SRC/video-worker.env" /etc/video-worker.env
+install -m 640 -o root -g "$APP_USER" "$SRC/zoom-webhook.env" /etc/zoom-webhook.env
+
+cat > /usr/local/bin/vp-storage <<'WRAP'
+#!/usr/bin/env bash
+set -a; . /etc/video-worker.env; set +a
+exec /opt/video-pipeline/venv/bin/python /opt/video-pipeline/app/storage_tool.py "$@"
+WRAP
+chmod 755 /usr/local/bin/vp-storage
+
+echo "== worker service"
+install -m 644 "$SRC/video-worker.service" /etc/systemd/system/video-worker.service
+install -m 644 "$SRC/zoom-webhook.service" /etc/systemd/system/zoom-webhook.service
+systemctl daemon-reload
+systemctl enable video-worker zoom-webhook
+systemctl restart video-worker zoom-webhook
+
+echo "== make processed bucket public (read-only)"
+set -a; . /etc/video-worker.env; set +a
+aws --endpoint-url "$S3_ENDPOINT" \
+    --region "$S3_REGION" \
+    s3api put-bucket-acl \
+    --bucket "$PROCESSED_BUCKET" \
+    --acl public-read || echo "Warning: could not set bucket ACL (may already be public)"
+
+echo "== nginx (HTTPS proxy for Zoom webhook via Cloudflare)"
+$APT install nginx
+
+cat > /etc/nginx/sites-available/zoom-webhook <<NGINX
+server {
+    listen 80;
+    server_name webhook.apkaai.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:${zoom_webhook_port};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300;
+    }
+}
+NGINX
+
+ln -sf /etc/nginx/sites-available/zoom-webhook /etc/nginx/sites-enabled/zoom-webhook
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl enable nginx && systemctl restart nginx
+
+# ── MONITORING STACK ────────────────────────────────────────────────────────
+
+echo "== prometheus"
+useradd -r -s /bin/false prometheus 2>/dev/null || true
+mkdir -p /etc/prometheus /var/lib/prometheus
+PROM_VER="2.52.0"
+curl -sL "https://github.com/prometheus/prometheus/releases/download/v$${PROM_VER}/prometheus-$${PROM_VER}.linux-amd64.tar.gz" \
+  | tar -xz -C /tmp
+install -m 755 /tmp/prometheus-$${PROM_VER}.linux-amd64/prometheus /usr/local/bin/prometheus
+install -m 644 "$SRC/prometheus.yml" /etc/prometheus/prometheus.yml
+chown -R prometheus:prometheus /etc/prometheus /var/lib/prometheus
+
+cat > /etc/systemd/system/prometheus.service <<'SVC'
+[Unit]
+Description=Prometheus
+After=network-online.target
+[Service]
+User=prometheus
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --web.listen-address=127.0.0.1:9090
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SVC
+
+echo "== node exporter"
+NODE_VER="1.8.0"
+curl -sL "https://github.com/prometheus/node_exporter/releases/download/v$${NODE_VER}/node_exporter-$${NODE_VER}.linux-amd64.tar.gz" \
+  | tar -xz -C /tmp
+install -m 755 /tmp/node_exporter-$${NODE_VER}.linux-amd64/node_exporter /usr/local/bin/node_exporter
+
+cat > /etc/systemd/system/node-exporter.service <<'SVC'
+[Unit]
+Description=Node Exporter
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SVC
+
+echo "== redis exporter"
+REDIS_EXP_VER="1.61.0"
+curl -sL "https://github.com/oliver006/redis_exporter/releases/download/v$${REDIS_EXP_VER}/redis_exporter-v$${REDIS_EXP_VER}.linux-amd64.tar.gz" \
+  | tar -xz -C /tmp
+install -m 755 /tmp/redis_exporter-v$${REDIS_EXP_VER}.linux-amd64/redis_exporter /usr/local/bin/redis_exporter
+
+cat > /etc/systemd/system/redis-exporter.service <<'SVC'
+[Unit]
+Description=Redis Exporter
+After=redis-server.service
+[Service]
+ExecStart=/usr/local/bin/redis_exporter
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SVC
+
+echo "== loki"
+LOKI_VER="3.0.0"
+curl -sL "https://github.com/grafana/loki/releases/download/v$${LOKI_VER}/loki-linux-amd64.zip" -o /tmp/loki.zip
+unzip -o /tmp/loki.zip loki-linux-amd64 -d /tmp/loki
+install -m 755 /tmp/loki/loki-linux-amd64 /usr/local/bin/loki
+mkdir -p /etc/loki /var/lib/loki
+
+cat > /etc/loki/loki.yml <<'CFG'
+auth_enabled: false
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+common:
+  path_prefix: /var/lib/loki
+  storage:
+    filesystem:
+      chunks_directory: /var/lib/loki/chunks
+      rules_directory: /var/lib/loki/rules
+  replication_factor: 1
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+CFG
+
+cat > /etc/systemd/system/loki.service <<'SVC'
+[Unit]
+Description=Loki
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/loki -config.file=/etc/loki/loki.yml
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SVC
+
+echo "== promtail"
+PROMTAIL_VER="3.0.0"
+curl -sL "https://github.com/grafana/loki/releases/download/v$${PROMTAIL_VER}/promtail-linux-amd64.zip" -o /tmp/promtail.zip
+unzip -o /tmp/promtail.zip promtail-linux-amd64 -d /tmp/promtail
+install -m 755 /tmp/promtail/promtail-linux-amd64 /usr/local/bin/promtail
+mkdir -p /etc/promtail
+install -m 644 "$SRC/promtail.yml" /etc/promtail/promtail.yml
+
+cat > /etc/systemd/system/promtail.service <<'SVC'
+[Unit]
+Description=Promtail
+After=loki.service
+[Service]
+ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail/promtail.yml
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SVC
+
+echo "== grafana"
+wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key
+echo "deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main" \
+  > /etc/apt/sources.list.d/grafana.list
+$APT update
+$APT install grafana
+
+mkdir -p /etc/grafana/provisioning/datasources
+install -m 644 "$SRC/grafana-datasources.yml" /etc/grafana/provisioning/datasources/datasources.yml
+
+systemctl daemon-reload
+for svc in prometheus node-exporter redis-exporter loki promtail grafana-server; do
+  systemctl enable "$svc"
+  systemctl restart "$svc"
+done
+
+sleep 5
+grafana-cli admin reset-admin-password "${grafana_password}" || true
+
+echo "== done"

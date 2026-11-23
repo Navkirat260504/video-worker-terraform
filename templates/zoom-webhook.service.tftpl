@@ -1,0 +1,17 @@
+[Unit]
+Description=Zoom webhook receiver — uploads recordings to S3 raw bucket
+After=network-online.target video-worker.service
+Wants=network-online.target
+
+[Service]
+User=${app_user}
+EnvironmentFile=/etc/zoom-webhook.env
+ExecStart=/opt/video-pipeline/venv/bin/python /opt/video-pipeline/app/zoom_webhook.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zoom-webhook
+
+[Install]
+WantedBy=multi-user.target

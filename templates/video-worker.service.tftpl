@@ -1,0 +1,15 @@
+[Unit]
+Description=Video transcode worker
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+User=${app_user}
+WorkingDirectory=/opt/video-pipeline/app
+EnvironmentFile=/etc/video-worker.env
+ExecStart=/opt/video-pipeline/venv/bin/python worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
